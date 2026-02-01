@@ -1,16 +1,23 @@
-#[warn(unused_imports)]
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{OpenOptions, File};
 use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+#[warn(unused_imports)]
 use tempfile::TempDir;
 use walkdir::WalkDir;
-use std::io::{Write, BufRead, BufReader, BufWriter, SeekFrom, Read, Seek};
-use std::io;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
+
+#[derive(Serialize, Deserialize, Debug)]
+enum Command {
+    Set { key: String, value: String },
+    Remove { key: String },
+}
 
 #[derive(Debug)]
 struct CommandPos {
@@ -19,14 +26,14 @@ struct CommandPos {
 }
 
 #[derive(Debug)]
-pub struct BitcaskPlus {
+pub struct BitCaskPlus {
     path: PathBuf,
     map: HashMap<String, CommandPos>,
     writer: BufWriter<File>,
     uncompacted: u64,
 }
 
-impl BitcaskPlus {
+impl BitCaskPlus {
     pub fn new() -> Self {
         let path = std::env::current_dir().expect("can't get current dir");
         let log_path = path.join("bitcaskplus.db");
@@ -46,15 +53,28 @@ impl BitcaskPlus {
     }
 
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
+        let cmd = Command::Set {
+            key: key.clone(),
+            value: val,
+        };
+        let bytes = postcard::to_stdvec(&cmd)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let len = bytes.len() as u64;
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::End(0))?;
-        let cmd = format!("{},{}\n", key, val);
-        let len = cmd.as_bytes().len() as u64;
-        self.writer.write_all(cmd.as_bytes());
+        self.writer.write_all(&len.to_le_bytes())?; // little indian
+        self.writer.write_all(&bytes)?;
         self.writer.flush()?;
 
-        if let Some(old_pos) = self.map.insert(key, CommandPos{pos,len}) {
-            self.uncompacted += old_pos.len + len;
+        let record_len = 8 + len;
+        if let Some(old_pos) = self.map.insert(
+            key,
+            CommandPos {
+                pos,
+                len: record_len,
+            },
+        ) {
+            self.uncompacted += old_pos.len;
         }
 
         if self.uncompacted > COMPACTION_THRESHOLD {
@@ -67,31 +87,44 @@ impl BitcaskPlus {
         if let Some(pos_info) = self.map.get(&key.to_string()) {
             let mut file = fs::File::open(self.path.join("bitcaskplus.db"))?;
             file.seek(std::io::SeekFrom::Start(pos_info.pos))?;
-            
-            let mut handle = file.take(pos_info.len);
-            let mut buffer = String::new();
-            handle.read_to_string(&mut buffer)?;
-            let parts: Vec<&str> = buffer.trim_end().splitn(2,',').collect();
-            if parts.len() == 2 {
-                return Ok(Some(parts[1].to_string()));
+
+            let mut header = [0u8; 8];
+            file.read_exact(&mut header);
+            let data_len = u64::from_le_bytes(header);
+            let mut buffer = vec![0u8; data_len as usize];
+            file.read_exact(&mut buffer);
+            let cmd: Command = postcard::from_bytes(&buffer)
+                .map_err(|e| format!("Postcard deserialization error: {}", e))?;
+
+            if let Command::Set { value, .. } = cmd {
+                return Ok(Some(value));
+            } else {
+                return Ok(None);
             }
         }
         Ok(None)
     }
 
     pub fn remove(&mut self, key: &str) -> Result<()> {
-        if !self.map.contains_key(&key.to_string()) {
-            return Err("KeyNotFound".into());
+        if !self.map.contains_key(key) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "KeyNotFound").into());
         }
-        let log_entry = format!("{},rm\n", key);
-        let len = log_entry.as_bytes().len() as u64;
+
+        let key_str = key.to_string();
+        let cmd = Command::Remove {
+            key: key_str.clone(),
+        };
+        let bytes = postcard::to_stdvec(&cmd)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let len = bytes.len() as u64;
         self.writer.flush()?;
         self.writer.seek(SeekFrom::End(0))?;
-        self.writer.write_all(log_entry.as_bytes())?;
+        self.writer.write_all(&len.to_le_bytes())?; // little indian
+        self.writer.write_all(&bytes)?;
         self.writer.flush()?;
 
-        if let Some(old_pos) = self.map.remove(&key.to_string()) {
-            self.uncompacted += old_pos.len + len;
+        if let Some(old_pos) = self.map.remove(&key_str) {
+            self.uncompacted += old_pos.len + (8 + len);
         }
 
         if self.uncompacted > COMPACTION_THRESHOLD {
@@ -100,7 +133,7 @@ impl BitcaskPlus {
         Ok(())
     }
 
-    pub fn open(path:impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         std::fs::create_dir_all(&path)?;
 
@@ -112,26 +145,48 @@ impl BitcaskPlus {
             .write(true)
             .create(true)
             .open(&log_path)?;
-    
-        let mut reader = BufReader::new(&file);
-        let mut pos:u64 = 0;
-        let mut line = String::new();
-        while reader.read_line(&mut line)? > 0 {
-            let len = line.len() as u64;
-            let parts: Vec<&str> = line.trim_end().splitn(2,',').collect();
-            if parts.len() == 2 {
-                let key = parts[0].to_string();
-                let val = parts[1];
-                if val == "rm" {
-                    map.remove(&key);
-                } else {
-                    map.insert(key, CommandPos { pos, len });
+
+        let mut reader = io::BufReader::new(&file);
+        let mut pos: u64 = 0;
+        loop {
+            let mut header = [0u8; 8];
+            match reader.read_exact(&mut header) {
+                Ok(_) => {
+                    let data_len = u64::from_le_bytes(header);
+                    let mut buffer = vec![0u8; data_len as usize];
+                    reader.read_exact(&mut buffer);
+                    let cmd: Command = postcard::from_bytes(&buffer)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    match cmd {
+                        Command::Set { key, .. } => {
+                            if let Some(old_pos) = map.insert(
+                                key,
+                                CommandPos {
+                                    pos,
+                                    len: 8 + data_len,
+                                },
+                            ) {
+                                uncompacted += old_pos.len;
+                            }
+                        }
+                        Command::Remove { key } => {
+                            if let Some(old_pos) = map.remove(&key) {
+                                uncompacted += old_pos.len + (8 + data_len);
+                            }
+                        }
+                    }
+                    pos += 8 + data_len;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
                 }
             }
-            pos+=len;
-            line.clear();
         }
-
+        let mut file = file;
+        file.seek(io::SeekFrom::End(0))?;
         let writer = io::BufWriter::new(file);
         Ok(Self {
             path,
@@ -151,17 +206,29 @@ impl BitcaskPlus {
         let mut new_pos = 0;
         let mut new_map = HashMap::new();
 
-        for (key,pos_info) in &self.map {
+        for (key, pos_info) in &self.map {
+            // get len and data
             old_file.seek(SeekFrom::Start(pos_info.pos))?;
-            let mut buffer = vec![0; pos_info.len as usize];
-            old_file.read_exact(&mut buffer)?;
+            let mut header = [0u8; 8];
+            old_file.read_exact(&mut header);
+            let data_len = u64::from_le_bytes(header);
+            let mut buffer = vec![0u8; data_len as usize];
+            old_file.read_exact(&mut buffer);
+
+            new_writer.write_all(&header)?;
             new_writer.write_all(&buffer)?;
-            new_map.insert(key.clone(), CommandPos {
-                pos: new_pos,
-                len: pos_info.len,
-            });
-            new_pos += pos_info.len;
+
+            new_map.insert(
+                key.clone(),
+                CommandPos {
+                    pos: new_pos,
+                    len: 8 + data_len,
+                },
+            );
+
+            new_pos += 8 + data_len;
         }
+
         new_writer.flush()?;
         drop(new_writer);
         drop(old_file);
@@ -180,14 +247,13 @@ impl BitcaskPlus {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn hash_map_works() -> Result<()> {
-        let mut store = BitcaskPlus::new();
+        let mut store = BitCaskPlus::new();
 
         store.set("key1".to_owned(), "value1".to_owned())?;
         store.set("key2".to_owned(), "value2".to_owned())?;
@@ -202,7 +268,7 @@ mod tests {
     #[test]
     fn get_stored_value() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         store.set("key1".to_owned(), "value1".to_owned())?;
         store.set("key2".to_owned(), "value2".to_owned())?;
 
@@ -211,7 +277,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key1")?, Some("value1".to_string()));
         assert_eq!(store.get("key2")?, Some("value2".to_string()));
 
@@ -222,7 +288,7 @@ mod tests {
     #[test]
     fn overwrite_value() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
 
         store.set("key1".to_string(), "value1".to_string())?;
         assert_eq!(store.get("key1")?, Some("value1".to_string()));
@@ -231,7 +297,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key1")?, Some("value2".to_string()));
         store.set("key1".to_string(), "value3".to_string())?;
         assert_eq!(store.get("key1")?, Some("value3".to_string()));
@@ -243,14 +309,14 @@ mod tests {
     #[test]
     fn get_non_existent_value() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
 
         store.set("key1".to_string(), "value1".to_string())?;
         assert_eq!(store.get("key2")?, None);
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key2")?, None);
 
         Ok(())
@@ -259,7 +325,7 @@ mod tests {
     #[test]
     fn remove_non_existent_key() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert!(store.remove("key1").is_err());
         Ok(())
     }
@@ -267,7 +333,7 @@ mod tests {
     #[test]
     fn remove_key() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         store.set("key1".to_string(), "value1".to_string())?;
         assert!(store.remove("key1").is_ok());
         assert_eq!(store.get("key1")?, None);
@@ -279,7 +345,7 @@ mod tests {
     #[test]
     fn compaction() -> Result<()> {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let mut store = BitcaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         let dir_size = || {
             let entries = WalkDir::new(temp_dir.path()).into_iter();
             let len: walkdir::Result<u64> = entries
@@ -307,7 +373,7 @@ mod tests {
             // Compaction triggered.
             drop(store);
             // reopen and check content.
-            let mut store = BitcaskPlus::open(temp_dir.path())?;
+            let mut store = BitCaskPlus::open(temp_dir.path())?;
             for key_id in 0..1000 {
                 let key = format!("key{}", key_id);
                 assert_eq!(store.get(&key)?, Some(format!("{}", iter)));
