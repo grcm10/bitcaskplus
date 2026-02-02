@@ -5,9 +5,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-#[warn(unused_imports)]
-use tempfile::TempDir;
-use walkdir::WalkDir;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -57,8 +54,7 @@ impl BitCaskPlus {
             key: key.clone(),
             value: val,
         };
-        let bytes = postcard::to_stdvec(&cmd)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let bytes = postcard::to_stdvec(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
         let len = bytes.len() as u64;
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::End(0))?;
@@ -84,15 +80,15 @@ impl BitCaskPlus {
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>> {
-        if let Some(pos_info) = self.map.get(&key.to_string()) {
+        if let Some(pos_info) = self.map.get(key) {
             let mut file = fs::File::open(self.path.join("bitcaskplus.db"))?;
             file.seek(std::io::SeekFrom::Start(pos_info.pos))?;
 
             let mut header = [0u8; 8];
-            file.read_exact(&mut header);
+            let _ = file.read_exact(&mut header);
             let data_len = u64::from_le_bytes(header);
             let mut buffer = vec![0u8; data_len as usize];
-            file.read_exact(&mut buffer);
+            let _ = file.read_exact(&mut buffer);
             let cmd: Command = postcard::from_bytes(&buffer)
                 .map_err(|e| format!("Postcard deserialization error: {}", e))?;
 
@@ -114,8 +110,7 @@ impl BitCaskPlus {
         let cmd = Command::Remove {
             key: key_str.clone(),
         };
-        let bytes = postcard::to_stdvec(&cmd)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let bytes = postcard::to_stdvec(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
         let len = bytes.len() as u64;
         self.writer.flush()?;
         self.writer.seek(SeekFrom::End(0))?;
@@ -144,6 +139,7 @@ impl BitCaskPlus {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&log_path)?;
 
         let mut reader = io::BufReader::new(&file);
@@ -154,9 +150,9 @@ impl BitCaskPlus {
                 Ok(_) => {
                     let data_len = u64::from_le_bytes(header);
                     let mut buffer = vec![0u8; data_len as usize];
-                    reader.read_exact(&mut buffer);
+                    let _ = reader.read_exact(&mut buffer);
                     let cmd: Command = postcard::from_bytes(&buffer)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     match cmd {
                         Command::Set { key, .. } => {
                             if let Some(old_pos) = map.insert(
@@ -210,10 +206,10 @@ impl BitCaskPlus {
             // get len and data
             old_file.seek(SeekFrom::Start(pos_info.pos))?;
             let mut header = [0u8; 8];
-            old_file.read_exact(&mut header);
+            let _ = old_file.read_exact(&mut header);
             let data_len = u64::from_le_bytes(header);
             let mut buffer = vec![0u8; data_len as usize];
-            old_file.read_exact(&mut buffer);
+            let _ = old_file.read_exact(&mut buffer);
 
             new_writer.write_all(&header)?;
             new_writer.write_all(&buffer)?;
@@ -235,7 +231,6 @@ impl BitCaskPlus {
         fs::rename(&compact_path, &log_path)?;
 
         let file = OpenOptions::new()
-            .write(true)
             .append(true)
             .create(true)
             .open(&log_path)?;
@@ -247,9 +242,17 @@ impl BitCaskPlus {
     }
 }
 
+impl Default for BitCaskPlus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use walkdir::WalkDir;
 
     #[test]
     fn hash_map_works() -> Result<()> {
@@ -277,7 +280,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitCaskPlus::open(temp_dir.path())?;
+        let store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key1")?, Some("value1".to_string()));
         assert_eq!(store.get("key2")?, Some("value2".to_string()));
 
@@ -316,7 +319,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitCaskPlus::open(temp_dir.path())?;
+        let store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key2")?, None);
 
         Ok(())
@@ -373,7 +376,7 @@ mod tests {
             // Compaction triggered.
             drop(store);
             // reopen and check content.
-            let mut store = BitCaskPlus::open(temp_dir.path())?;
+            let store = BitCaskPlus::open(temp_dir.path())?;
             for key_id in 0..1000 {
                 let key = format!("key{}", key_id);
                 assert_eq!(store.get(&key)?, Some(format!("{}", iter)));
