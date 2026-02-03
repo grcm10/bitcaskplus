@@ -45,6 +45,15 @@ impl BitCaskPlus {
 
         let mut reader = io::BufReader::new(&file);
         let mut pos: u64 = 0;
+
+        let hint_path = path.join("bitcaskplus.hint");
+        if hint_path.exists() {
+            let hint_content = std::fs::read(&hint_path)?;
+            let result: Vec<(String, CommandPos)> =
+                postcard::from_bytes(&hint_content).map_err(|e| io::Error::other(e.to_string()))?;
+            map = result.into_iter().collect();
+        }
+
         loop {
             let mut header = [0u8; 8];
             match reader.read_exact(&mut header) {

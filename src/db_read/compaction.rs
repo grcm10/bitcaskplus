@@ -2,14 +2,14 @@ use crate::{BitCaskPlus, CommandPos, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 
 impl BitCaskPlus {
     pub fn compaction(&mut self) -> Result<()> {
         self.writer.flush()?;
         let compact_path = self.path.join("bitcaskplus.db.compact");
         let log_path = self.path.join("bitcaskplus.db");
-        //let hint_file_path = self.path.join("bitcaskplus.hint");
+        let hint_file_path = self.path.join("bitcaskplus.hint");
 
         let mut new_writer = BufWriter::new(File::create(&compact_path)?);
         let mut old_file = File::open(&log_path)?;
@@ -42,6 +42,15 @@ impl BitCaskPlus {
         drop(new_writer);
         drop(old_file);
         fs::rename(&compact_path, &log_path)?;
+
+        if hint_file_path.exists() {
+            fs::remove_file(&hint_file_path)?;
+        }
+
+        let hint_data: Vec<(&String, &CommandPos)> = new_map.iter().collect();
+        let hint_bytes =
+            postcard::to_stdvec(&hint_data).map_err(|e| io::Error::other(e.to_string()))?;
+        std::fs::write(hint_file_path, hint_bytes)?;
 
         let file = OpenOptions::new()
             .append(true)
