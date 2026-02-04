@@ -1,6 +1,5 @@
 use crate::{BitCaskPlus, COMPACTION_THRESHOLD, Command, CommandPos, Result};
-use std::io;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 
 impl BitCaskPlus {
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
@@ -8,15 +7,17 @@ impl BitCaskPlus {
             key: key.clone(),
             value: val,
         };
-        let bytes = postcard::to_stdvec(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
-        let len = bytes.len() as u64;
+
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::End(0))?;
-        self.writer.write_all(&len.to_le_bytes())?; // little indian
-        self.writer.write_all(&bytes)?;
+        let json_data =
+            serde_json::to_string_pretty(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
+        let json_data_len = json_data.len() as u64;
+        self.writer.write_all(&json_data_len.to_le_bytes())?; // Little-Endian
+        self.writer.write_all(json_data.as_bytes())?;
         self.writer.flush()?;
 
-        let record_len = 8 + len;
+        let record_len = 8 + json_data_len;
         if let Some(old_pos) = self.map.insert(
             key,
             CommandPos {
@@ -42,16 +43,17 @@ impl BitCaskPlus {
         let cmd = Command::Remove {
             key: key_str.clone(),
         };
-        let bytes = postcard::to_stdvec(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
-        let len = bytes.len() as u64;
+
         self.writer.flush()?;
-        self.writer.seek(SeekFrom::End(0))?;
-        self.writer.write_all(&len.to_le_bytes())?; // little indian
-        self.writer.write_all(&bytes)?;
+        let json_data =
+            serde_json::to_string_pretty(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
+        let json_data_len = json_data.len() as u64;
+        self.writer.write_all(&json_data_len.to_le_bytes())?;
+        self.writer.write_all(json_data.as_bytes())?;
         self.writer.flush()?;
 
         if let Some(old_pos) = self.map.remove(&key_str) {
-            self.uncompacted += old_pos.len + (8 + len);
+            self.uncompacted += old_pos.len + (8 + json_data_len);
         }
 
         if self.uncompacted > COMPACTION_THRESHOLD {

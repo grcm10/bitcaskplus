@@ -12,6 +12,7 @@ impl BitCaskPlus {
         let hint_file_path = self.path.join("bitcaskplus.hint");
 
         let mut new_writer = BufWriter::new(File::create(&compact_path)?);
+        let mut hint_writer = BufWriter::new(File::create(&hint_file_path)?);
         let mut old_file = File::open(&log_path)?;
         let mut new_pos = 0;
         let mut new_map = HashMap::new();
@@ -43,14 +44,15 @@ impl BitCaskPlus {
         drop(old_file);
         fs::rename(&compact_path, &log_path)?;
 
-        if hint_file_path.exists() {
-            fs::remove_file(&hint_file_path)?;
+        for (key, pos) in &new_map {
+            let entry_data = serde_json::to_string_pretty(&(key, pos))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let entry_data_len = entry_data.len() as u32;
+            hint_writer.write_all(&entry_data_len.to_le_bytes())?;
+            hint_writer.write_all(entry_data.as_bytes())?;
         }
-
-        let hint_data: Vec<(&String, &CommandPos)> = new_map.iter().collect();
-        let hint_bytes =
-            postcard::to_stdvec(&hint_data).map_err(|e| io::Error::other(e.to_string()))?;
-        std::fs::write(hint_file_path, hint_bytes)?;
+        hint_writer.flush()?;
+        drop(hint_writer);
 
         let file = OpenOptions::new()
             .append(true)

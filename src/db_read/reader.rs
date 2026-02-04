@@ -1,7 +1,6 @@
 use crate::{BitCaskPlus, Command, CommandPos, Result};
 use std::collections::HashMap;
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
@@ -17,8 +16,8 @@ impl BitCaskPlus {
             let data_len = u64::from_le_bytes(header);
             let mut buffer = vec![0u8; data_len as usize];
             let _ = file.read_exact(&mut buffer);
-            let cmd: Command = postcard::from_bytes(&buffer)
-                .map_err(|e| format!("Postcard deserialization error: {}", e))?;
+            let cmd = serde_json::from_slice(&buffer)
+                .map_err(|e| format!("Serde json deserialization error: {}", e))?;
 
             if let Command::Set { value, .. } = cmd {
                 return Ok(Some(value));
@@ -43,17 +42,32 @@ impl BitCaskPlus {
             .truncate(false)
             .open(&log_path)?;
 
-        let mut reader = io::BufReader::new(&file);
-        let mut pos: u64 = 0;
-
         let hint_path = path.join("bitcaskplus.hint");
         if hint_path.exists() {
-            let hint_content = std::fs::read(&hint_path)?;
-            let result: Vec<(String, CommandPos)> =
-                postcard::from_bytes(&hint_content).map_err(|e| io::Error::other(e.to_string()))?;
-            map = result.into_iter().collect();
+            let mut reader = io::BufReader::new(File::open(&hint_path)?);
+            loop {
+                let mut header = [0u8; 4];
+                match reader.read_exact(&mut header) {
+                    Ok(_) => {
+                        let len = u32::from_le_bytes(header) as usize;
+                        let mut buffer = vec![0u8; len];
+                        reader.read_exact(&mut buffer)?;
+                        let (key, pos): (String, CommandPos) = serde_json::from_slice(&buffer)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        map.insert(key, pos);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
         }
 
+        let mut reader = io::BufReader::new(&file);
+        let mut pos: u64 = 0;
         loop {
             let mut header = [0u8; 8];
             match reader.read_exact(&mut header) {
@@ -61,7 +75,7 @@ impl BitCaskPlus {
                     let data_len = u64::from_le_bytes(header);
                     let mut buffer = vec![0u8; data_len as usize];
                     let _ = reader.read_exact(&mut buffer);
-                    let cmd: Command = postcard::from_bytes(&buffer)
+                    let cmd = serde_json::from_slice(&buffer)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     match cmd {
                         Command::Set { key, .. } => {

@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 clap = "4.5.55"
 serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.0", features = ["use-std"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 assert_cmd = "2.1.2"
