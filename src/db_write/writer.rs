@@ -10,14 +10,16 @@ impl BitCaskPlus {
 
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::End(0))?;
-        let json_data =
-            serde_json::to_string_pretty(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
+        let json_data = serde_json::to_string(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
         let json_data_len = json_data.len() as u64;
+        let checksum = crc32fast::hash(json_data.as_bytes());
+        // CRC(4) + Len(8) + Data(N)
+        self.writer.write_all(&checksum.to_le_bytes())?;
         self.writer.write_all(&json_data_len.to_le_bytes())?; // Little-Endian
         self.writer.write_all(json_data.as_bytes())?;
         self.writer.flush()?;
 
-        let record_len = 8 + json_data_len;
+        let record_len = 4 + 8 + json_data_len;
         if let Some(old_pos) = self.map.insert(
             key,
             CommandPos {
@@ -45,15 +47,17 @@ impl BitCaskPlus {
         };
 
         self.writer.flush()?;
-        let json_data =
-            serde_json::to_string_pretty(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
+        let json_data = serde_json::to_string(&cmd).map_err(|e| io::Error::other(e.to_string()))?;
         let json_data_len = json_data.len() as u64;
-        self.writer.write_all(&json_data_len.to_le_bytes())?;
+        let checksum = crc32fast::hash(json_data.as_bytes());
+        // CRC(4) + Len(8) + Data(N)
+        self.writer.write_all(&checksum.to_le_bytes())?;
+        self.writer.write_all(&json_data_len.to_le_bytes())?; // Little-Endian
         self.writer.write_all(json_data.as_bytes())?;
         self.writer.flush()?;
 
         if let Some(old_pos) = self.map.remove(&key_str) {
-            self.uncompacted += old_pos.len + (8 + json_data_len);
+            self.uncompacted += old_pos.len + (4 + 8 + json_data_len);
         }
 
         if self.uncompacted > COMPACTION_THRESHOLD {

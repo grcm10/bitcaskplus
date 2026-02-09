@@ -11,11 +11,20 @@ impl BitCaskPlus {
             let mut file = fs::File::open(self.path.join("bitcaskplus.db"))?;
             file.seek(std::io::SeekFrom::Start(pos_info.pos))?;
 
+            let mut checksum = [0u8; 4];
+            file.read_exact(&mut checksum)?;
+            let expected_crc = u32::from_le_bytes(checksum);
+
             let mut header = [0u8; 8];
             let _ = file.read_exact(&mut header);
             let data_len = u64::from_le_bytes(header);
             let mut buffer = vec![0u8; data_len as usize];
             let _ = file.read_exact(&mut buffer);
+
+            let actual_crc = crc32fast::hash(&buffer);
+            if actual_crc != expected_crc {
+                return Err(io::Error::other("crc mismatch").into());
+            }
             let cmd = serde_json::from_slice(&buffer)
                 .map_err(|e| format!("Serde json deserialization error: {}", e))?;
 
@@ -69,21 +78,32 @@ impl BitCaskPlus {
         let mut reader = io::BufReader::new(&file);
         let mut pos: u64 = 0;
         loop {
-            let mut header = [0u8; 8];
-            match reader.read_exact(&mut header) {
+            let mut checksum = [0u8; 4];
+            match reader.read_exact(&mut checksum) {
                 Ok(_) => {
+                    let expected_crc = u32::from_le_bytes(checksum);
+                    let mut header = [0u8; 8];
+                    reader.read_exact(&mut header)?;
                     let data_len = u64::from_le_bytes(header);
                     let mut buffer = vec![0u8; data_len as usize];
                     let _ = reader.read_exact(&mut buffer);
+
+                    // check if the data is corrupted.
+                    let actual_crc = crc32fast::hash(&buffer);
+                    if expected_crc != actual_crc {
+                        return Err(io::Error::other("crc mismatch"));
+                    }
+
                     let cmd = serde_json::from_slice(&buffer)
                         .map_err(|e| io::Error::other(e.to_string()))?;
+
                     match cmd {
                         Command::Set { key, .. } => {
                             if let Some(old_pos) = map.insert(
                                 key,
                                 CommandPos {
                                     pos,
-                                    len: 8 + data_len,
+                                    len: 4 + 8 + data_len,
                                 },
                             ) {
                                 uncompacted += old_pos.len;
@@ -91,11 +111,11 @@ impl BitCaskPlus {
                         }
                         Command::Remove { key } => {
                             if let Some(old_pos) = map.remove(&key) {
-                                uncompacted += old_pos.len + (8 + data_len);
+                                uncompacted += old_pos.len + (4 + 8 + data_len);
                             }
                         }
                     }
-                    pos += 8 + data_len;
+                    pos += 4 + 8 + data_len;
                 }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     break;

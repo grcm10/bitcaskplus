@@ -18,13 +18,25 @@ impl BitCaskPlus {
         let mut new_map = HashMap::new();
 
         for (key, pos_info) in &self.map {
-            // get len and data
+            // get checksum, len and data
             old_file.seek(SeekFrom::Start(pos_info.pos))?;
+
+            let mut checksum = [0u8; 4];
+            old_file.read_exact(&mut checksum)?;
+            let expected_crc = u32::from_le_bytes(checksum);
+
             let mut header = [0u8; 8];
             let _ = old_file.read_exact(&mut header);
             let data_len = u64::from_le_bytes(header);
             let mut buffer = vec![0u8; data_len as usize];
             let _ = old_file.read_exact(&mut buffer);
+
+            let actual_crc = crc32fast::hash(&buffer);
+            if actual_crc != expected_crc {
+                return Err(io::Error::other("crc mismatch").into());
+            }
+
+            new_writer.write_all(&expected_crc.to_le_bytes())?;
             new_writer.write_all(&header)?;
             new_writer.write_all(&buffer)?;
 
@@ -32,11 +44,11 @@ impl BitCaskPlus {
                 key.clone(),
                 CommandPos {
                     pos: new_pos,
-                    len: 8 + data_len,
+                    len: 4 + 8 + data_len,
                 },
             );
 
-            new_pos += 8 + data_len;
+            new_pos += 4 + 8 + data_len;
         }
 
         new_writer.flush()?;
