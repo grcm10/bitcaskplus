@@ -13,7 +13,7 @@ impl BitCaskPlus {
 
         let mut new_writer = BufWriter::new(File::create(&compact_path)?);
         let mut hint_writer = BufWriter::new(File::create(&hint_file_path)?);
-        let mut old_file = File::open(&log_path)?;
+        let mut old_file = self.writer.get_mut().try_clone()?;
         let mut new_pos = 0;
         let mut new_map = HashMap::new();
 

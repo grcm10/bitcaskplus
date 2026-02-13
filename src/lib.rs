@@ -89,7 +89,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let store = BitCaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key1")?, Some("value1".to_string()));
         assert_eq!(store.get("key2")?, Some("value2".to_string()));
 
@@ -128,7 +128,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let store = BitCaskPlus::open(temp_dir.path())?;
+        let mut store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key2")?, None);
 
         Ok(())
@@ -185,7 +185,7 @@ mod tests {
             // Compaction triggered.
             drop(store);
             // reopen and check content.
-            let store = BitCaskPlus::open(temp_dir.path())?;
+            let mut store = BitCaskPlus::open(temp_dir.path())?;
             for key_id in 0..1000 {
                 let key = format!("key{}", key_id);
                 assert_eq!(store.get(&key)?, Some(format!("{}", iter)));

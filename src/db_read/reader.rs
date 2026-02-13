@@ -1,7 +1,7 @@
 use crate::{BitCaskPlus, Command, CommandPos, Result};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::io::{Read, Seek};
 use std::path::PathBuf;
 
@@ -77,10 +77,11 @@ impl Iterator for DataReader {
 }
 
 impl BitCaskPlus {
-    pub fn get(&self, key: &str) -> Result<Option<String>> {
+    pub fn get(&mut self, key: &str) -> Result<Option<String>> {
+        self.writer.flush()?;
         if let Some(pos_info) = self.map.get(key) {
             let mut d = DataReader {
-                file: fs::File::open(self.path.join("bitcaskplus.db"))?,
+                file: self.writer.get_ref().try_clone()?,
             };
             d.file.seek(std::io::SeekFrom::Start(pos_info.pos))?;
             let (expect_crc, buffer) = d.read_data()?;
