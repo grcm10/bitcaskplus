@@ -1,9 +1,9 @@
-use crate::{BitCaskPlus, Command, CommandPos, Result};
+use crate::{BitCaskPlus, Command, CommandPos, DataReader, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::io::{Read, Seek};
+use std::io::{self, Seek};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 struct HintReader<R: io::Read> {
     reader: R,
@@ -36,84 +36,42 @@ impl<R: io::Read> Iterator for HintReader<R> {
         }
     }
 }
-struct DataReader {
-    file: File,
-}
-
-impl DataReader {
-    pub fn read_data(&mut self) -> io::Result<(u32, Vec<u8>)> {
-        let mut checksum = [0u8; 4];
-        self.file.read_exact(&mut checksum)?;
-        let expected_crc = u32::from_le_bytes(checksum);
-
-        let mut header = [0u8; 8];
-        let _ = self.file.read_exact(&mut header);
-        let data_len = u64::from_le_bytes(header);
-        let mut buffer = vec![0u8; data_len as usize];
-        let _ = self.file.read_exact(&mut buffer);
-        Ok((expected_crc, buffer))
-    }
-}
-
-impl Iterator for DataReader {
-    type Item = io::Result<(Command, u64)>;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.read_data() {
-            Ok((expect_crc, buf)) => {
-                // check if the data is corrupted.
-                let actual_crc = crc32fast::hash(&buf);
-                if expect_crc != actual_crc {
-                    return Some(Err(io::Error::other("crc mismatch")));
-                }
-                let res = serde_json::from_slice(&buf)
-                    .map(|cmd| (cmd, buf.len() as u64))
-                    .map_err(|e| io::Error::other(e.to_string()));
-                Some(res)
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
 
 impl BitCaskPlus {
     pub fn get(&mut self, key: &str) -> Result<Option<String>> {
-        self.writer.flush()?;
-        if let Some(pos_info) = self.map.get(key) {
-            let mut d = DataReader {
-                file: self.writer.get_ref().try_clone()?,
-            };
-            d.file.seek(std::io::SeekFrom::Start(pos_info.pos))?;
-            let (expect_crc, buffer) = d.read_data()?;
-            let actual_crc = crc32fast::hash(&buffer);
-            if actual_crc != expect_crc {
-                return Err(io::Error::other("crc mismatch").into());
-            }
-            let cmd = serde_json::from_slice(&buffer)
-                .map_err(|e| format!("Serde json deserialization error: {}", e))?;
+        let pos_info = self.map.read().unwrap().get(key).cloned();
+        let p = match pos_info {
+            Some(p) => p,
+            None => return Ok(None),
+        };
 
-            if let Command::Set { value, .. } = cmd {
-                return Ok(Some(value));
-            } else {
-                return Ok(None);
-            }
+        let (expect_crc, buffer) = { self.reader.read_data(p.pos)? };
+        let actual_crc = crc32fast::hash(&buffer);
+        if actual_crc != expect_crc {
+            return Err(io::Error::other("crc mismatch").into());
         }
-        Ok(None)
+        let cmd = serde_json::from_slice(&buffer)
+            .map_err(|e| format!("Serde json deserialization error: {}", e))?;
+        if let Command::Set { value, .. } = cmd {
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let path = path.into();
+        let path: PathBuf = path.into();
         std::fs::create_dir_all(&path)?;
-
         let log_path = path.join("bitcaskplus.db");
-        let mut map = HashMap::new();
-        let mut uncompacted = 0;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
             .truncate(false)
             .open(&log_path)?;
+
+        let mut map = HashMap::new();
+        let mut uncompacted = 0;
 
         let hint_path = path.join("bitcaskplus.hint");
         if hint_path.exists() {
@@ -124,14 +82,12 @@ impl BitCaskPlus {
         }
 
         let mut pos: u64 = 0;
-        let d = DataReader {
-            file: file.try_clone()?,
-        };
+        let mut reader = DataReader::new(file.try_clone().expect("clone failed"), 0);
 
-        for result in d {
+        for result in reader.by_ref() {
             match result {
                 Ok((cmd, data_len)) => {
-                    let entry_len = 4 + 8 + data_len;
+                    let entry_len = 12 + data_len;
 
                     match cmd {
                         Command::Set { key, .. } => {
@@ -161,13 +117,19 @@ impl BitCaskPlus {
             }
         }
 
-        file.seek(io::SeekFrom::End(0))?;
-        let writer = io::BufWriter::new(file);
-        Ok(Self {
-            path,
-            map,
-            writer,
-            uncompacted,
-        })
+        let mut f_for_writer = file.try_clone().expect("clone failed");
+        f_for_writer.seek(io::SeekFrom::End(0))?;
+        let writer = io::BufWriter::new(f_for_writer);
+        let res = {
+            Self {
+                path,
+                map: Arc::new(RwLock::new(map)),
+                writer: Arc::new(Mutex::new(writer)),
+                reader,
+                uncompacted,
+            }
+        };
+
+        Ok(res)
     }
 }
