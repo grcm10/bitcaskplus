@@ -59,9 +59,7 @@ impl Iterator for DataReader {
                 let res = serde_json::from_slice(&buf)
                     .map(|cmd| (cmd, buf.len() as u64))
                     .map_err(|e| io::Error::other(e.to_string()));
-                let ret = &res;
-                let (_, data_len) = ret.as_ref().ok()?;
-                self.cursor += 12 + data_len;
+                self.cursor += 12 + buf.len() as u64;
                 Some(res)
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
