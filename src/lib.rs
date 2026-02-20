@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Seek};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,56 +14,59 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
-struct DataReader {
-    file: Arc<RwLock<File>>,
+pub struct DataReader {
+    file: Arc<File>,
     cursor: u64,
 }
 
 impl DataReader {
     pub fn new(f: File, c: u64) -> Self {
         Self {
-            file: Arc::new(RwLock::new(f)),
+            file: Arc::new(f),
             cursor: c,
         }
     }
 
-    pub fn read_data(&mut self, pos: u64) -> io::Result<(u32, Vec<u8>)> {
-        let file_guard = self
-            .file
-            .read()
-            .map_err(|_| std::io::Error::other("Lock poisoned"))?;
-        let mut header_buf = [0u8; 12];
-        file_guard.read_exact_at(&mut header_buf, pos)?;
-
-        let expected_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        let data_len = u64::from_le_bytes(header_buf[4..12].try_into().unwrap());
-        if data_len >= 10 * COMPACTION_THRESHOLD {
+    pub fn read_data(&self, pos: u64, len: u64) -> io::Result<(u32, Vec<u8>)> {
+        if len >= 10 * COMPACTION_THRESHOLD {
             return Err(io::Error::other("over capacity"));
         }
-        let mut buffer = vec![0u8; data_len as usize];
-        file_guard.read_exact_at(&mut buffer, pos + 12)?;
+        let mut buffer = vec![0u8; len as usize];
+        self.file.read_exact_at(&mut buffer, pos)?;
+        let expected_crc = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
         Ok((expected_crc, buffer))
     }
 }
 
 impl Iterator for DataReader {
-    type Item = io::Result<(Command, u64)>;
+    type Item = io::Result<(Command, CommandPos)>;
     fn next(&mut self) -> Option<Self::Item> {
-        match self.read_data(self.cursor) {
-            Ok((expect_crc, buf)) => {
-                // check if the data is corrupted.
-                let actual_crc = crc32fast::hash(&buf);
-                if expect_crc != actual_crc {
-                    return Some(Err(io::Error::other("crc mismatch")));
-                }
-                let res = serde_json::from_slice(&buf)
-                    .map(|cmd| (cmd, buf.len() as u64))
-                    .map_err(|e| io::Error::other(e.to_string()));
-                self.cursor += 12 + buf.len() as u64;
-                Some(res)
+        let pos = self.cursor;
+        let mut header_buf = [0u8; 12];
+        if let Err(e) = self.file.read_exact_at(&mut header_buf, pos) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return None;
             }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
-            Err(e) => Some(Err(e)),
+            return Some(Err(e));
+        }
+        let data_len = u64::from_le_bytes(header_buf[4..12].try_into().unwrap());
+        let total_len = 12 + data_len;
+
+        let mut data_buf = vec![0u8; data_len as usize];
+        if let Err(e) = self.file.read_exact_at(&mut data_buf, pos + 12) {
+            return Some(Err(e));
+        }
+        self.cursor += total_len;
+        match serde_json::from_slice::<Command>(&data_buf) {
+            Ok(cmd) => Some(Ok((
+                cmd,
+                CommandPos {
+                    file_num: 0,
+                    pos,
+                    len: total_len,
+                },
+            ))),
+            Err(e) => Some(Err(io::Error::other(e))),
         }
     }
 }
@@ -76,6 +79,7 @@ pub enum Command {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CommandPos {
+    file_num: u64,
     pos: u64,
     len: u64,
 }
@@ -85,8 +89,28 @@ pub struct BitCaskPlus {
     path: PathBuf,
     map: Arc<RwLock<HashMap<String, CommandPos>>>,
     writer: Arc<Mutex<BufWriter<File>>>,
-    reader: DataReader,
+    readers: Arc<RwLock<HashMap<u64, DataReader>>>,
     uncompacted: u64,
+    cur_gen: u64,
+}
+
+pub fn new_log_file(
+    path: &PathBuf,
+    gen_num: u64,
+    readers: &mut HashMap<u64, DataReader>,
+) -> io::Result<File> {
+    let log_path = path.join(format!("{}.db", gen_num));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&log_path)?;
+    let reader = DataReader::new(file.try_clone().expect("clone failed"), 0);
+    readers.insert(gen_num, reader);
+
+    let mut file = file;
+    file.seek(io::SeekFrom::End(0))?;
+    Ok(file)
 }
 
 impl BitCaskPlus {
@@ -105,8 +129,9 @@ impl BitCaskPlus {
             writer: Arc::new(Mutex::new(BufWriter::new(
                 file.try_clone().expect("clone failed"),
             ))),
-            reader: DataReader::new(file, 0),
+            readers: Arc::new(RwLock::new(HashMap::new())),
             uncompacted: 0,
+            cur_gen: 0,
         }
     }
 }
@@ -145,7 +170,7 @@ mod tests {
         // Open from disk again and check persistent data.
         drop(store);
 
-        let mut store = BitCaskPlus::open(temp_dir.path())?;
+        let store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key1")?, Some("value1".to_string()));
         assert_eq!(store.get("key2")?, Some("value2".to_string()));
 
@@ -184,7 +209,7 @@ mod tests {
 
         // Open from disk again and check persistent data.
         drop(store);
-        let mut store = BitCaskPlus::open(temp_dir.path())?;
+        let store = BitCaskPlus::open(temp_dir.path())?;
         assert_eq!(store.get("key2")?, None);
 
         Ok(())
@@ -241,7 +266,7 @@ mod tests {
             // Compaction triggered.
             drop(store);
             // reopen and check content.
-            let mut store = BitCaskPlus::open(temp_dir.path())?;
+            let store = BitCaskPlus::open(temp_dir.path())?;
             for key_id in 0..1000 {
                 let key = format!("key{}", key_id);
                 assert_eq!(store.get(&key)?, Some(format!("{}", iter)));

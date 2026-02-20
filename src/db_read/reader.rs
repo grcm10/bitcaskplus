@@ -1,8 +1,9 @@
 use crate::{BitCaskPlus, Command, CommandPos, DataReader, Result};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Seek};
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 struct HintReader<R: io::Read> {
@@ -37,20 +38,95 @@ impl<R: io::Read> Iterator for HintReader<R> {
     }
 }
 
+pub fn sorted_file_list(path: &Path) -> io::Result<Vec<u64>> {
+    let mut file_list: Vec<u64> = fs::read_dir(&path)?
+        .flat_map(|r| -> Result<_> { Ok(r?.path()) })
+        .filter(|path| path.is_file() && path.extension() == Some("db".as_ref()))
+        .flat_map(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .map(|s| s.trim_end_matches(".db"))
+                .map(str::parse::<u64>)
+        })
+        .flatten()
+        .collect();
+    file_list.sort_unstable();
+    Ok(file_list)
+}
+
+pub fn load(
+    path: &PathBuf,
+    file_num: u64,
+    map: &mut HashMap<String, CommandPos>,
+) -> io::Result<(DataReader, u64)> {
+    let log_path = &path.join(format!("{}.db", file_num));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&log_path)?;
+    let mut reader = DataReader::new(file.try_clone().expect("clone failed"), 0);
+    let mut uncompacted = 0;
+    //TODO: Got mismatch error when introducing hint file.
+    /*let hint_path = &path.join(format!("{}.db.hint", file_num));
+    if hint_path.exists() {
+        /*let f_reader = io::BufReader::new(File::open(&hint_path)?);
+        let hint_map: io::Result<HashMap<String, CommandPos>> = HintReader::new(f_reader).collect();
+        map.extend(hint_map?);*/
+    }*/
+    for result in reader.by_ref() {
+        match result {
+            Ok((cmd, mut cmd_pos)) => {
+                cmd_pos.file_num = file_num;
+                match cmd {
+                    Command::Set { key, .. } => {
+                        if let Some(old_pos) = map.insert(key, cmd_pos) {
+                            uncompacted += old_pos.len;
+                        }
+                    }
+                    Command::Remove { key } => {
+                        if let Some(old_pos) = map.remove(&key) {
+                            uncompacted += old_pos.len;
+                        }
+                        uncompacted += cmd_pos.len;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("read data error：{}", e);
+                break;
+            }
+        }
+    }
+    Ok((reader, uncompacted))
+}
+
 impl BitCaskPlus {
-    pub fn get(&mut self, key: &str) -> Result<Option<String>> {
-        let pos_info = self.map.read().unwrap().get(key).cloned();
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
+        let pos_info = {
+            let map = self.map.read().unwrap();
+            map.get(key).cloned()
+        };
+
         let p = match pos_info {
             Some(p) => p,
             None => return Ok(None),
         };
+        let readers = self.readers.read().unwrap();
+        let reader = readers.get(&p.file_num).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Log file {} not found", p.file_num),
+            )
+        })?;
+        let (expect_crc, buffer) = { reader.read_data(p.pos, p.len)? };
 
-        let (expect_crc, buffer) = { self.reader.read_data(p.pos)? };
-        let actual_crc = crc32fast::hash(&buffer);
+        let actual_crc = crc32fast::hash(&buffer[12..]);
         if actual_crc != expect_crc {
             return Err(io::Error::other("crc mismatch").into());
         }
-        let cmd = serde_json::from_slice(&buffer)
+        let cmd = serde_json::from_slice(&buffer[12..])
             .map_err(|e| format!("Serde json deserialization error: {}", e))?;
         if let Command::Set { value, .. } = cmd {
             Ok(Some(value))
@@ -61,72 +137,29 @@ impl BitCaskPlus {
 
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path: PathBuf = path.into();
-        std::fs::create_dir_all(&path)?;
-        let log_path = path.join("bitcaskplus.db");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&log_path)?;
-
-        let mut map = HashMap::new();
+        fs::create_dir_all(&path)?;
+        let file_list = sorted_file_list(&path)?;
+        let mut readers = HashMap::new();
+        let mut map: HashMap<String, CommandPos> = HashMap::new();
         let mut uncompacted = 0;
 
-        let hint_path = path.join("bitcaskplus.hint");
-        if hint_path.exists() {
-            let reader = io::BufReader::new(File::open(&hint_path)?);
-            let new_map: io::Result<HashMap<String, CommandPos>> =
-                HintReader::new(reader).collect();
-            map.extend(new_map?);
+        for &f in &file_list {
+            let (reader, un_com) = load(&path, f, &mut map)?;
+            uncompacted += un_com;
+            readers.insert(f, reader);
         }
 
-        let mut pos: u64 = 0;
-        let mut reader = DataReader::new(file.try_clone().expect("clone failed"), 0);
-
-        for result in reader.by_ref() {
-            match result {
-                Ok((cmd, data_len)) => {
-                    let entry_len = 12 + data_len;
-
-                    match cmd {
-                        Command::Set { key, .. } => {
-                            if let Some(old_pos) = map.insert(
-                                key,
-                                CommandPos {
-                                    pos,
-                                    len: entry_len,
-                                },
-                            ) {
-                                uncompacted += old_pos.len;
-                            }
-                        }
-                        Command::Remove { key } => {
-                            if let Some(old_pos) = map.remove(&key) {
-                                uncompacted += old_pos.len;
-                            }
-                            uncompacted += entry_len;
-                        }
-                    }
-                    pos += entry_len;
-                }
-                Err(e) => {
-                    eprintln!("read data error：{}", e);
-                    break;
-                }
-            }
-        }
-
-        let mut f_for_writer = file.try_clone().expect("clone failed");
-        f_for_writer.seek(io::SeekFrom::End(0))?;
-        let writer = io::BufWriter::new(f_for_writer);
+        let cur_gen = file_list.last().unwrap_or(&0) + 1;
+        let file = crate::new_log_file(&path, cur_gen, &mut readers)?;
+        let writer = io::BufWriter::new(file);
         let res = {
             Self {
                 path,
                 map: Arc::new(RwLock::new(map)),
                 writer: Arc::new(Mutex::new(writer)),
-                reader,
+                readers: Arc::new(RwLock::new(readers)),
                 uncompacted,
+                cur_gen,
             }
         };
 

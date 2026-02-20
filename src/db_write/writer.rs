@@ -14,6 +14,7 @@ impl BitCaskPlus {
         w.write_all(json_data.as_bytes())?;
         w.flush()?;
         Ok(CommandPos {
+            file_num: self.cur_gen,
             pos,
             len: 12 + json_data_len,
         })
@@ -41,17 +42,16 @@ impl BitCaskPlus {
     }
 
     pub fn remove(&mut self, key: &str) -> Result<()> {
-        let old_pos = {
-            let mut m = self.map.write().unwrap();
-            m.remove(key)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?
-        };
-
         let cmd = Command::Remove {
             key: key.to_string(),
         };
 
         let cmd_pos = self.write_data(&cmd)?;
+        let old_pos = {
+            let mut m = self.map.write().unwrap();
+            m.remove(key)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?
+        };
         self.uncompacted += old_pos.len + cmd_pos.len;
 
         if self.uncompacted > COMPACTION_THRESHOLD {
